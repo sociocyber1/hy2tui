@@ -4,6 +4,8 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+  release:
+    types: [published]
 permissions:
   contents: write
 jobs:
@@ -23,4 +25,5 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --title "hy2tui $GITHUB_REF_NAME" --notes-file .github/release-notes.md
+          [ -n "$(gh release view "$GITHUB_REF_NAME" --json body -q .body)" ] || gh release edit "$GITHUB_REF_NAME" --notes-file .github/release-notes.md
           gh release upload "$GITHUB_REF_NAME" hy2tui-linux-x86_64 hy2tui-linux-x86_64.sha256 --clobber
