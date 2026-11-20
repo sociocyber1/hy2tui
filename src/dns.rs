@@ -114,6 +114,8 @@ pub struct DnsServer {
     stop: Arc<AtomicBool>,
     /// tunnel DNS servers, in priority order (hot-swappable)
     ups: Arc<std::sync::RwLock<Vec<SocketAddr>>>,
+    /// answer AAAA queries with "no IPv6 address" (server has no IPv6)
+    no_aaaa: Arc<AtomicBool>,
 }
 
 /// Well-known resolvers: name → IPs (for quick adding).
@@ -152,7 +154,48 @@ pub fn probe(server: &str) -> Option<u64> {
     Some(t0.elapsed().as_millis() as u64)
 }
 
+/// Reply to `q` with NOERROR and no answers ("this name has no address of
+/// that type"). Apps then use IPv4 right away instead of trying IPv6.
+pub fn empty_reply(q: &[u8]) -> Option<Vec<u8>> {
+    if q.len() < 12 || u16_at(q, 4)? != 1 {
+        return None;
+    }
+    let end = read_name(q, 12)?.1 + 4;
+    if end > q.len() {
+        return None;
+    }
+    let mut r = q[..end].to_vec();
+    r[2] = 0x80 | (q[2] & 0x01); // QR, keep RD
+    r[3] = 0x80; // RA, NOERROR
+    for b in &mut r[6..12] {
+        *b = 0;
+    }
+    Some(r)
+}
+
+/// Does IPv6 work through the tunnel? Asks public resolvers over TCP:
+/// Some(true) = yes, Some(false) = IPv4 works but IPv6 doesn't,
+/// None = can't tell (IPv4 is down too).
+pub fn ipv6_works() -> Option<bool> {
+    let q = build_query("example.com", 0x6666);
+    let v6: Vec<SocketAddr> = ["[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53"].iter().map(|a| a.parse().unwrap()).collect();
+    if ask_tcp(&q, &v6).is_some() {
+        return Some(true);
+    }
+    let v4: Vec<SocketAddr> = ["1.1.1.1:53", "8.8.8.8:53"].iter().map(|a| a.parse().unwrap()).collect();
+    ask_tcp(&q, &v4).map(|_| false)
+}
+
 impl DnsServer {
+    /// Allow (true) or filter (false) IPv6 answers.
+    pub fn set_ipv6(&self, on: bool) {
+        self.no_aaaa.store(!on, Ordering::Relaxed);
+    }
+
+    pub fn ipv6_on(&self) -> bool {
+        !self.no_aaaa.load(Ordering::Relaxed)
+    }
+
     /// Replace the tunnel DNS servers while running (order = priority).
     pub fn set_upstreams(&self, servers: &[String]) {
         let v = upstreams(servers);
@@ -228,7 +271,14 @@ fn report(tx: &Sender<DnsEvent>, q: &[u8], ans: Option<&[u8]>, t0: Instant, tcp:
 
 /// Resolve through the tunnel, or directly for notToVPN names (and route
 /// the answer's IPs outside the tunnel before the app sees them).
-fn resolve(q: &[u8], ups: &[SocketAddr], bypass: Option<&crate::split::Bypass>, tcp: bool) -> (Option<Vec<u8>>, bool) {
+fn resolve(q: &[u8], ups: &[SocketAddr], bypass: Option<&crate::split::Bypass>, tcp: bool, no_aaaa: bool) -> (Option<Vec<u8>>, bool) {
+    if no_aaaa && q.len() > 12 {
+        if let Some((_, t)) = parse_query(q) {
+            if t == "AAAA" {
+                return (empty_reply(q), false);
+            }
+        }
+    }
     let ask = |servers: &[SocketAddr]| if tcp { ask_tcp(q, servers).or_else(|| ask_udp(q, servers)) } else { ask_udp(q, servers).or_else(|| ask_tcp(q, servers)) };
     if let Some(b) = bypass {
         if let Some((name, _)) = parse_query(q) {
@@ -247,7 +297,8 @@ fn resolve(q: &[u8], ups: &[SocketAddr], bypass: Option<&crate::split::Bypass>, 
 }
 
 impl DnsServer {
-    pub fn start(servers: &[String], tx: Sender<DnsEvent>, bypass: Option<std::sync::Arc<crate::split::Bypass>>) -> std::io::Result<Self> {
+    /// `ipv6`: start with IPv6 answers allowed (can be changed with `set_ipv6`).
+    pub fn start(servers: &[String], tx: Sender<DnsEvent>, bypass: Option<std::sync::Arc<crate::split::Bypass>>, ipv6: bool) -> std::io::Result<Self> {
         let first = upstreams(servers);
         if first.is_empty() {
             return Err(std::io::Error::other("no upstream DNS IPs"));
@@ -259,6 +310,7 @@ impl DnsServer {
         let tcp = TcpListener::bind(addr)?;
         tcp.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let no_aaaa = Arc::new(AtomicBool::new(!ipv6));
         if let Some(b) = &bypass {
             // the forwarder's own queries to the direct DNS must not enter the tunnel
             let ips: Vec<IpAddr> = b.direct_dns.iter().map(|a| a.ip()).collect();
@@ -266,18 +318,18 @@ impl DnsServer {
         }
 
         {
-            let (stop, ups, tx, bypass) = (stop.clone(), ups.clone(), tx.clone(), bypass.clone());
+            let (stop, ups, tx, bypass, no_aaaa) = (stop.clone(), ups.clone(), tx.clone(), bypass.clone(), no_aaaa.clone());
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 while !stop.load(Ordering::Relaxed) {
                     let Ok((n, from)) = udp.recv_from(&mut buf) else { continue };
                     let q = buf[..n].to_vec();
-                    let (ups, tx, bypass) = (ups.clone(), tx.clone(), bypass.clone());
+                    let (ups, tx, bypass, na) = (ups.clone(), tx.clone(), bypass.clone(), no_aaaa.load(Ordering::Relaxed));
                     let Ok(sock) = udp.try_clone() else { continue };
                     std::thread::spawn(move || {
                         let t0 = Instant::now();
                         let list = ups.read().unwrap().clone();
-                        let (ans, direct) = resolve(&q, &list, bypass.as_deref(), false);
+                        let (ans, direct) = resolve(&q, &list, bypass.as_deref(), false, na);
                         if let Some(a) = &ans {
                             let _ = sock.send_to(a, from);
                         }
@@ -287,12 +339,12 @@ impl DnsServer {
             });
         }
         {
-            let (stop, ups) = (stop.clone(), ups.clone());
+            let (stop, ups, no_aaaa) = (stop.clone(), ups.clone(), no_aaaa.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match tcp.accept() {
                         Ok((mut c, _)) => {
-                            let (ups, tx, bypass) = (ups.clone(), tx.clone(), bypass.clone());
+                            let (ups, tx, bypass, na) = (ups.clone(), tx.clone(), bypass.clone(), no_aaaa.load(Ordering::Relaxed));
                             std::thread::spawn(move || {
                                 let _ = c.set_nonblocking(false);
                                 let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
@@ -302,7 +354,7 @@ impl DnsServer {
                                 if c.read_exact(&mut q).is_err() { return; }
                                 let t0 = Instant::now();
                                 let list = ups.read().unwrap().clone();
-                                let (ans, direct) = resolve(&q, &list, bypass.as_deref(), true);
+                                let (ans, direct) = resolve(&q, &list, bypass.as_deref(), true, na);
                                 if let Some(a) = &ans {
                                     let mut out = (a.len() as u16).to_be_bytes().to_vec();
                                     out.extend_from_slice(a);
@@ -316,13 +368,35 @@ impl DnsServer {
                 }
             });
         }
-        Ok(DnsServer { stop, ups })
+        Ok(DnsServer { stop, ups, no_aaaa })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_aaaa_reply() {
+        let mut q = build_query("youtube.com", 0x0102);
+        let n = q.len();
+        q[n - 3] = 28; // AAAA
+        q.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]); // EDNS OPT
+        q[11] = 1; // arcount 1
+        let r = empty_reply(&q).unwrap();
+        assert_eq!(&r[..2], &[1, 2]);
+        assert_eq!(r[2] & 0x80, 0x80);
+        assert_eq!(&r[6..12], &[0; 6]);
+        assert_eq!(r.len(), n);
+        let (st, ips, _) = parse_answer(&r).unwrap();
+        assert_eq!(st, "NOERROR");
+        assert!(ips.is_empty());
+        assert_eq!(parse_query(&r).unwrap().1, "AAAA");
+        // the forwarder answers AAAA itself when IPv6 is hidden (no upstream needed)
+        let (ans, direct) = resolve(&q, &[], None, false, true);
+        assert_eq!(ans.unwrap(), r);
+        assert!(!direct);
+    }
 
     // query for example.com A, id 0x1234
     fn query() -> Vec<u8> {
@@ -365,7 +439,7 @@ mod tests {
     #[ignore] // binds 127.0.53.53:53 (root) and needs an upstream resolver
     fn server_end_to_end() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let _srv = DnsServer::start(&["1.1.1.1".into()], tx, None).expect("bind");
+        let _srv = DnsServer::start(&["1.1.1.1".into()], tx, None, true).expect("bind");
         // UDP
         let c = UdpSocket::bind("127.0.0.1:0").unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

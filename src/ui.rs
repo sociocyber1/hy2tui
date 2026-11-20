@@ -301,7 +301,14 @@ fn draw_profiles(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(if s.override_dns { s.dns.join(" → ") } else { "system".into() }, Style::new().fg(TEXT)),
         Span::styled("  [D]", Style::new().fg(DIM)),
     ]));
-    lines.push(Line::styled(format!(" sysctl tuning {}", flag(s.tune_sysctl)), Style::new().fg(DIM)));
+    let v6 = match (s.ipv6.as_str(), app.session.as_ref().and_then(|x| x.dns_server.as_ref()).map(|d| d.ipv6_on())) {
+        ("off", _) => "off".to_string(),
+        ("on", _) => "on".to_string(),
+        (_, Some(true)) => "auto: on".to_string(),
+        (_, Some(false)) => "auto: hidden (server has no IPv6)".to_string(),
+        _ => "auto".to_string(),
+    };
+    lines.push(Line::styled(format!(" IPv6 {v6}   sysctl tuning {}", flag(s.tune_sysctl)), Style::new().fg(DIM)));
     lines.push(Line::styled(format!(" {}", app.paths.config_file.display()), Style::new().fg(DIM).italic()));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(panel("details")), right);
 }

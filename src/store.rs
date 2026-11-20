@@ -48,6 +48,9 @@ pub struct Settings {
     pub not_to_vpn_domains: Vec<String>,
     /// DNS used for notToVPN names (reached outside the tunnel)
     pub direct_dns: Vec<String>,
+    /// IPv6 through the tunnel: "auto" (check whether the server has IPv6,
+    /// otherwise hide IPv6 addresses so sites load over IPv4), "on", "off".
+    pub ipv6: String,
     /// Path to the hysteria core; empty = auto.
     pub core_path: String,
 }
@@ -69,6 +72,7 @@ impl Default for Settings {
             not_to_vpn: false,
             not_to_vpn_domains: ["ru", "рф", "su", "by", "kz", "ua"].iter().map(|s| s.to_string()).collect(),
             direct_dns: vec!["77.88.8.8".into(), "77.88.8.1".into()],
+            ipv6: "auto".into(),
             core_path: String::new(),
         }
     }

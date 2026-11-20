@@ -117,7 +117,7 @@ pub struct Stats {
     last_cpu: Option<(u64, Instant)>,
 }
 
-enum Probe { Latency(Option<u64>), Ip(Option<String>), Apps(std::collections::HashMap<u16, String>), DnsTimes(Vec<(String, Option<u64>)>) }
+enum Probe { Latency(Option<u64>), Ip(Option<String>), Apps(std::collections::HashMap<u16, String>), DnsTimes(Vec<(String, Option<u64>)>), Ipv6(Option<bool>) }
 
 pub struct App {
     pub paths: Paths,
@@ -340,7 +340,7 @@ impl App {
         }
         let dns = if s.tun && s.override_dns {
             // our forwarder logs every query and maps IPs → domains
-            let servers = match DnsServer::start(&s.dns, self.dns_tx.clone(), bypass.clone()) {
+            let servers = match DnsServer::start(&s.dns, self.dns_tx.clone(), bypass.clone(), s.ipv6 == "on") {
                 Ok(srv) => {
                     dns_server = Some(srv);
                     vec![crate::dns::LISTEN_IP.to_string()]
@@ -419,6 +419,14 @@ impl App {
                 self.status = Status::Connected;
                 self.auto_repaired = false;
                 self.last_ip = None; // refresh exit IP now
+                // does the server have IPv6? if not, hide IPv6 addresses
+                if self.store.settings.ipv6 == "auto" && self.session.as_ref().is_some_and(|s| s.dns_server.is_some()) {
+                    let tx = self.probe_tx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(800));
+                        let _ = tx.send(Probe::Ipv6(crate::dns::ipv6_works()));
+                    });
+                }
             }
             if self.traffic.on_log(&l) {
                 continue; // connection event → connections tab
@@ -476,6 +484,22 @@ impl App {
                 Probe::DnsTimes(v) => {
                     self.dns_probing = false;
                     self.dns_times.extend(v);
+                }
+                Probe::Ipv6(v) => {
+                    let Some(srv) = self.session.as_ref().and_then(|s| s.dns_server.as_ref()) else { continue };
+                    match v {
+                        Some(true) => {
+                            if !srv.ipv6_on() {
+                                srv.set_ipv6(true);
+                                self.log(Level::Info, "IPv6 works through the server — IPv6 enabled");
+                            }
+                        }
+                        Some(false) => {
+                            srv.set_ipv6(false);
+                            self.log(Level::Info, "server has no IPv6 — sites use IPv4 (IPv6 addresses hidden, nothing leaks)");
+                        }
+                        None => {}
+                    }
                 }
             }
         }
