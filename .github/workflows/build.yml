@@ -1,0 +1,26 @@
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release && cargo test --release
+      - run: |
+          cp target/release/hy2tui hy2tui-linux-x86_64
+          sha256sum hy2tui-linux-x86_64 > hy2tui-linux-x86_64.sha256
+      - uses: actions/upload-artifact@v4
+        with: { name: hy2tui-linux-x86_64, path: "hy2tui-linux-x86_64*" }
+      # version tag (v1.2.3) → GitHub release with the binary
+      - if: startsWith(github.ref, 'refs/tags/v')
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "hy2tui $GITHUB_REF_NAME" --notes-file .github/release-notes.md
+          gh release upload "$GITHUB_REF_NAME" hy2tui-linux-x86_64 hy2tui-linux-x86_64.sha256 --clobber
