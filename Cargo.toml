@@ -1,0 +1,29 @@
+[package]
+name = "hy2tui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal Hysteria2 client: full-system TUN VPN with a btop-like dashboard"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+percent-encoding = "2"
+signal-hook = "0.3"
+libc = "0.2"
+sha2 = "0.10"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "socks", "http2", "system-proxy"] }
+lzma-rs = "0.3"
+idna = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"
