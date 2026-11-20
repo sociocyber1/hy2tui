@@ -3,7 +3,8 @@ name = "hy2tui"
 version = "0.1.0"
 edition = "2021"
 description = "Terminal Hysteria2 client: full-system TUN VPN with a btop-like dashboard"
-license = "MIT"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/sociocyber1/hy2tui"
 
 [dependencies]
 ratatui = "0.29"
