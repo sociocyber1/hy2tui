@@ -117,7 +117,7 @@ pub struct Stats {
     last_cpu: Option<(u64, Instant)>,
 }
 
-enum Probe { Latency(Option<u64>), Ip(Option<String>), Apps(std::collections::HashMap<u16, String>), DnsTimes(Vec<(String, Option<u64>)>), Ipv6(Option<bool>) }
+enum Probe { Latency(Option<u64>), Ip(Option<String>), Apps(std::collections::HashMap<u16, String>), DnsTimes(Vec<(String, Option<u64>)>), Ipv6(Option<bool>), DnsBench(Vec<(String, String, Option<u64>)>) }
 
 pub struct App {
     pub paths: Paths,
@@ -152,6 +152,9 @@ pub struct App {
     /// measured round-trip per DNS server (D → t)
     pub dns_times: std::collections::HashMap<String, Option<u64>>,
     pub dns_probing: bool,
+    /// all presets tested (D → b): (provider, ip, ms), fastest first
+    pub dns_bench: Vec<(String, String, Option<u64>)>,
+    pub dns_benching: bool,
     auto_repaired: bool,
     last_proxy_addr: String,
     last_apps: Instant,
@@ -184,7 +187,7 @@ impl App {
             tab: Tab::Overview, traffic: Traffic::default(), dns_log: VecDeque::new(),
             conn_scroll: 0, dns_scroll: 0, only_open: false,
             frame: 0, flow_down: 0.0, flow_up: 0.0, disp_down: 0.0, disp_up: 0.0,
-            dns_tx, dns_rx, probing_apps: false, dns_times: Default::default(), dns_probing: false, auto_repaired: false, last_proxy_addr, last_apps: Instant::now(),
+            dns_tx, dns_rx, probing_apps: false, dns_times: Default::default(), dns_probing: false, dns_bench: vec![], dns_benching: false, auto_repaired: false, last_proxy_addr, last_apps: Instant::now(),
             log_tx, log_rx, probe_tx, probe_rx,
             probing_lat: false, probing_ip: false, last_lat: None, last_ip: None,
             last_sample: Instant::now(), last_dns_check: Instant::now(), clk: net::clk_tck(),
@@ -484,6 +487,13 @@ impl App {
                 Probe::DnsTimes(v) => {
                     self.dns_probing = false;
                     self.dns_times.extend(v);
+                }
+                Probe::DnsBench(v) => {
+                    self.dns_benching = false;
+                    for (_, ip, t) in &v {
+                        self.dns_times.insert(ip.clone(), *t);
+                    }
+                    self.dns_bench = v;
                 }
                 Probe::Ipv6(v) => {
                     let Some(srv) = self.session.as_ref().and_then(|s| s.dns_server.as_ref()) else { continue };
@@ -1001,6 +1011,25 @@ impl App {
                 } else {
                     armed = true;
                     self.toast("press r again to reset DNS servers to defaults (1.1.1.1, 8.8.8.8)", false);
+                }
+            }
+            KeyCode::Char('b') => {
+                if !self.dns_benching {
+                    self.dns_benching = true;
+                    let tx = self.probe_tx.clone();
+                    std::thread::spawn(move || { let _ = tx.send(Probe::DnsBench(crate::dns::bench_presets())); });
+                }
+            }
+            KeyCode::Char('f') => {
+                // the two fastest answering providers, both their addresses ordered by speed
+                let best: Vec<String> = self.dns_bench.iter().filter(|(_, _, t)| t.is_some()).take(2).map(|(_, ip, _)| ip.clone()).collect();
+                if best.is_empty() {
+                    self.toast("press b first to test the providers", true);
+                } else {
+                    self.store.settings.dns = best.clone();
+                    sel = 0;
+                    self.apply_dns();
+                    self.toast(format!("using the fastest: {}", best.join(" → ")), false);
                 }
             }
             KeyCode::Char('t') => {

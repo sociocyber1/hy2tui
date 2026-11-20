@@ -851,8 +851,9 @@ fn draw_popup(f: &mut Frame, app: &App) {
         }
         Popup::Dns { sel, adding, reset_armed } => {
             let list = &app.store.settings.dns;
-            let h = (list.len() as u16 + 12).min(f.area().height.saturating_sub(2));
-            let r = centered(f.area(), 70, h);
+            let bench = if app.dns_benching || !app.dns_bench.is_empty() { app.dns_bench.len().min(8) as u16 + 2 } else { 0 };
+            let h = (list.len() as u16 + 12 + bench).min(f.area().height.saturating_sub(2));
+            let r = centered(f.area(), 74, h);
             f.render_widget(Clear, r);
             let mut lines = vec![
                 Line::styled(" Order = priority: the first server is asked first, the next one if it fails.", Style::new().fg(DIM)),
@@ -875,6 +876,22 @@ fn draw_popup(f: &mut Frame, app: &App) {
                     if i == 0 { Span::styled("  primary", Style::new().fg(ACCENT)) } else { Span::raw("") },
                 ]));
             }
+            if app.dns_benching || !app.dns_bench.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(if app.dns_benching { " testing all providers through the tunnel…" } else { " all providers, fastest first (f = use the top 2):" }, Style::new().fg(ACCENT)));
+                for (name, ip, t) in app.dns_bench.iter().take(8) {
+                    let (txt, col) = match t {
+                        Some(ms) => (format!("{ms:>5} ms"), if *ms < 80 { DOWN } else if *ms < 250 { WARN } else { ERR }),
+                        None => ("  no answer".to_string(), ERR),
+                    };
+                    let used = if list.contains(ip) { "  ✓ in use" } else { "" };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("   {name:<11} {ip:<16}"), Style::new().fg(TEXT)),
+                        Span::styled(txt, Style::new().fg(col)),
+                        Span::styled(used, Style::new().fg(DIM)),
+                    ]));
+                }
+            }
             lines.push(Line::raw(""));
             if let Some(buf) = adding {
                 lines.push(Line::from(vec![
@@ -882,13 +899,13 @@ fn draw_popup(f: &mut Frame, app: &App) {
                     Span::styled(buf.clone(), Style::new().fg(TEXT)),
                     Span::styled("█", Style::new().fg(ACCENT)),
                 ]));
-                lines.push(Line::styled(" IP address(es) or: cloudflare, google, quad9, adguard, opendns — Enter to add", Style::new().fg(DIM)));
+                lines.push(Line::styled(" IP(s) or: cloudflare google quad9 dnssb uncensored dns4eu adguard opendns", Style::new().fg(DIM)));
             } else {
                 let k = |key: &str, l: &str| vec![Span::styled(format!(" {key} "), Style::new().fg(Color::Black).bg(TITLE).bold()), Span::styled(format!(" {l} "), Style::new().fg(DIM))];
                 let mut l1 = vec![];
-                for (a, b) in [("a", "add"), ("d", "delete"), ("K/J", "priority ↑↓"), ("t", "speed test")] { l1.extend(k(a, b)); }
+                for (a, b) in [("a", "add"), ("d", "delete"), ("K/J", "priority ↑↓"), ("t", "test mine")] { l1.extend(k(a, b)); }
                 let mut l2 = vec![];
-                for (a, b) in [("r r", "reset to defaults"), ("Esc", "close")] { l2.extend(k(a, b)); }
+                for (a, b) in [("b", "test all providers"), ("f", "use fastest"), ("r r", "reset"), ("Esc", "close")] { l2.extend(k(a, b)); }
                 lines.push(Line::from(l1));
                 lines.push(Line::from(l2));
                 if *reset_armed {

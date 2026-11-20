@@ -5,7 +5,9 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -119,10 +121,20 @@ pub struct DnsServer {
 }
 
 /// Well-known resolvers: name → IPs (for quick adding).
+/// All of these answer plain DNS on port 53 (what the forwarder speaks).
+/// LibreDNS and Mullvad DNS are DoH/DoT-only, so they can't be used here.
 pub const PRESETS: &[(&str, &[&str])] = &[
     ("cloudflare", &["1.1.1.1", "1.0.0.1"]),
     ("google", &["8.8.8.8", "8.8.4.4"]),
+    // non-profit, no logging of IPs
     ("quad9", &["9.9.9.9", "149.112.112.112"]),
+    // privacy-focused, no logs, no filtering (xTom, Germany)
+    ("dnssb", &["185.222.222.222", "45.11.45.11"]),
+    // free, uncensored, no logging (Denmark)
+    ("uncensored", &["91.239.100.100", "89.233.43.71"]),
+    // EU public resolver, unfiltered variant
+    ("dns4eu", &["86.54.11.100", "86.54.11.200"]),
+    // blocks ads and trackers
     ("adguard", &["94.140.14.14", "94.140.15.15"]),
     ("opendns", &["208.67.222.222", "208.67.220.220"]),
 ];
@@ -146,12 +158,38 @@ pub fn build_query(name: &str, id: u16) -> Vec<u8> {
     q
 }
 
-/// Round-trip time of one DNS server (asks for example.com).
+/// Round-trip time of one DNS server: best of 3 lookups (UDP, then TCP if
+/// UDP gets nothing), so one lost packet doesn't spoil the result.
 pub fn probe(server: &str) -> Option<u64> {
     let ip: IpAddr = server.parse().ok()?;
-    let t0 = Instant::now();
-    ask_udp(&build_query("example.com", 0x4242), &[SocketAddr::new(ip, 53)])?;
-    Some(t0.elapsed().as_millis() as u64)
+    let up = [SocketAddr::new(ip, 53)];
+    let mut best: Option<u64> = None;
+    for (i, name) in ["example.com", "wikipedia.org", "example.org"].iter().enumerate() {
+        let q = build_query(name, 0x4240 + i as u16);
+        let t0 = Instant::now();
+        if ask_udp(&q, &up).or_else(|| ask_tcp(&q, &up)).is_some() {
+            let ms = t0.elapsed().as_millis() as u64;
+            best = Some(best.map_or(ms, |b| b.min(ms)));
+        }
+    }
+    best
+}
+
+/// Test every preset (first address of each) at once: (provider, ip, ms).
+pub fn bench_presets() -> Vec<(String, String, Option<u64>)> {
+    let hs: Vec<_> = PRESETS
+        .iter()
+        .map(|(name, ips)| {
+            let (name, ip) = (name.to_string(), ips[0].to_string());
+            std::thread::spawn(move || {
+                let t = probe(&ip);
+                (name, ip, t)
+            })
+        })
+        .collect();
+    let mut v: Vec<_> = hs.into_iter().filter_map(|h| h.join().ok()).collect();
+    v.sort_by_key(|(_, _, t)| t.unwrap_or(u64::MAX));
+    v
 }
 
 /// Reply to `q` with NOERROR and no answers ("this name has no address of
@@ -256,6 +294,222 @@ fn ask_tcp(q: &[u8], ups: &[SocketAddr]) -> Option<Vec<u8>> {
     None
 }
 
+// ---------------------------------------------------------------- fast path
+//
+// Why: through the tunnel a single UDP packet can get lost, and asking the
+// servers one after another with long waits made lookups take 5–13 s.
+// Now: answers are cached (by TTL); a query goes to the first server over
+// UDP *and* over a kept-open TCP connection at once, the other servers join
+// after 300 ms, and the first good answer wins (usually one round-trip).
+
+const CACHE_MAX: usize = 4096;
+
+struct CacheEntry {
+    until: Instant,
+    msg: Vec<u8>,
+}
+
+fn cache() -> &'static Mutex<HashMap<(String, u16, bool), CacheEntry>> {
+    static C: OnceLock<Mutex<HashMap<(String, u16, bool), CacheEntry>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// (lower-case name, qtype) of the question.
+fn cache_key(q: &[u8]) -> Option<(String, u16)> {
+    if q.len() < 12 || u16_at(q, 4)? != 1 {
+        return None;
+    }
+    let (name, p) = read_name(q, 12)?;
+    Some((name.to_ascii_lowercase(), u16_at(q, p)?))
+}
+
+/// Smallest TTL among the answers (or a short default for "no data").
+fn ttl_of(m: &[u8]) -> Option<u32> {
+    let qd = u16_at(m, 4)?;
+    let an = u16_at(m, 6)?;
+    let mut p = 12;
+    for _ in 0..qd {
+        p = read_name(m, p)?.1 + 4;
+    }
+    let mut ttl = u32::MAX;
+    for _ in 0..an {
+        p = read_name(m, p)?.1;
+        let t = u32::from_be_bytes(m.get(p + 4..p + 8)?.try_into().ok()?);
+        ttl = ttl.min(t);
+        p += 10 + u16_at(m, p + 8)? as usize;
+    }
+    Some(if an == 0 { 60 } else { ttl })
+}
+
+fn cache_get(q: &[u8], direct: bool) -> Option<Vec<u8>> {
+    let (name, t) = cache_key(q)?;
+    let c = cache().lock().unwrap();
+    let e = c.get(&(name, t, direct))?;
+    if e.until <= Instant::now() {
+        return None;
+    }
+    let mut m = e.msg.clone();
+    m[0] = q[0]; // the asker's query id
+    m[1] = q[1];
+    Some(m)
+}
+
+fn cache_put(q: &[u8], a: &[u8], direct: bool) {
+    let rcode = a.get(3).map(|b| b & 0x0F).unwrap_or(2);
+    if rcode != 0 && rcode != 3 {
+        return; // don't remember SERVFAIL & co
+    }
+    let (Some((name, t)), Some(ttl)) = (cache_key(q), ttl_of(a)) else { return };
+    let ttl = ttl.clamp(10, 1800);
+    let mut c = cache().lock().unwrap();
+    if c.len() >= CACHE_MAX {
+        let now = Instant::now();
+        c.retain(|_, e| e.until > now);
+        if c.len() >= CACHE_MAX {
+            c.clear();
+        }
+    }
+    c.insert((name, t, direct), CacheEntry { until: Instant::now() + Duration::from_secs(ttl as u64), msg: a.to_vec() });
+}
+
+/// A kept-open DNS-over-TCP connection; many queries share it (pipelined,
+/// matched by query id). Through the tunnel this is a reliable QUIC stream.
+struct TcpPipe {
+    w: Mutex<TcpStream>,
+    pending: Mutex<HashMap<u16, (u16, Sender<Vec<u8>>)>>,
+    next: AtomicU16,
+    dead: AtomicBool,
+}
+
+impl TcpPipe {
+    fn connect(up: SocketAddr) -> std::io::Result<Arc<Self>> {
+        let s = TcpStream::connect_timeout(&up, Duration::from_secs(3))?;
+        let _ = s.set_nodelay(true);
+        let mut r = s.try_clone()?;
+        let pipe = Arc::new(TcpPipe { w: Mutex::new(s), pending: Default::default(), next: AtomicU16::new(1), dead: AtomicBool::new(false) });
+        let p2 = pipe.clone();
+        std::thread::spawn(move || {
+            loop {
+                let mut len = [0u8; 2];
+                if r.read_exact(&mut len).is_err() {
+                    break;
+                }
+                let mut m = vec![0u8; u16::from_be_bytes(len) as usize];
+                if m.len() < 2 || r.read_exact(&mut m).is_err() {
+                    break;
+                }
+                let id = u16::from_be_bytes([m[0], m[1]]);
+                if let Some((orig, tx)) = p2.pending.lock().unwrap().remove(&id) {
+                    m[..2].copy_from_slice(&orig.to_be_bytes());
+                    let _ = tx.send(m);
+                }
+            }
+            p2.dead.store(true, Ordering::Relaxed);
+            p2.pending.lock().unwrap().clear();
+        });
+        Ok(pipe)
+    }
+
+    fn ask(&self, q: &[u8], tx: Sender<Vec<u8>>) -> bool {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let orig = u16::from_be_bytes([q[0], q[1]]);
+        self.pending.lock().unwrap().insert(id, (orig, tx));
+        let mut out = Vec::with_capacity(q.len() + 2);
+        out.extend_from_slice(&(q.len() as u16).to_be_bytes());
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&q[2..]);
+        let ok = self.w.lock().unwrap().write_all(&out).is_ok();
+        if !ok {
+            self.dead.store(true, Ordering::Relaxed);
+            self.pending.lock().unwrap().remove(&id);
+        }
+        ok
+    }
+}
+
+fn pipe_for(up: SocketAddr) -> Option<Arc<TcpPipe>> {
+    static P: OnceLock<Mutex<HashMap<SocketAddr, Arc<TcpPipe>>>> = OnceLock::new();
+    let pool = P.get_or_init(Default::default);
+    if let Some(p) = pool.lock().unwrap().get(&up) {
+        if !p.dead.load(Ordering::Relaxed) {
+            return Some(p.clone());
+        }
+    }
+    let p = TcpPipe::connect(up).ok()?;
+    pool.lock().unwrap().insert(up, p.clone());
+    Some(p)
+}
+
+/// UDP with one resend (a lost packet costs 700 ms, not seconds).
+fn udp_try(q: &[u8], up: SocketAddr) -> Option<Vec<u8>> {
+    let s = UdpSocket::bind(if up.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
+    s.connect(up).ok()?;
+    let mut buf = vec![0u8; 4096];
+    for wait in [700u64, 1500] {
+        s.send(q).ok()?;
+        let _ = s.set_read_timeout(Some(Duration::from_millis(wait)));
+        if let Ok(n) = s.recv(&mut buf) {
+            if n >= 12 && buf[..2] == q[..2] {
+                buf.truncate(n);
+                return Some(buf);
+            }
+        }
+    }
+    None
+}
+
+/// Ask the servers in parallel; first good answer wins.
+fn race(q: &[u8], ups: &[SocketAddr]) -> Option<Vec<u8>> {
+    if ups.is_empty() || q.len() < 12 {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let launch = |up: SocketAddr| {
+        let (q1, t1) = (q.to_vec(), tx.clone());
+        std::thread::spawn(move || {
+            if let Some(a) = udp_try(&q1, up) {
+                let _ = t1.send(a);
+            }
+        });
+        let (q2, t2) = (q.to_vec(), tx.clone());
+        std::thread::spawn(move || {
+            if let Some(p) = pipe_for(up) {
+                if !p.ask(&q2, t2.clone()) {
+                    // stale connection: one fresh try
+                    if let Some(p) = pipe_for(up) {
+                        p.ask(&q2, t2);
+                    }
+                }
+            }
+        });
+    };
+    let deadline = Instant::now() + Duration::from_millis(4500);
+    let mut fallback = None;
+    let wait_one = |until: Instant, fallback: &mut Option<Vec<u8>>| -> Option<Vec<u8>> {
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(a) => {
+                    let rc = a[3] & 0x0F;
+                    if rc == 0 || rc == 3 {
+                        return Some(a);
+                    }
+                    fallback.get_or_insert(a); // SERVFAIL etc.: maybe another server knows better
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    };
+    launch(ups[0]);
+    if let Some(a) = wait_one(Instant::now() + Duration::from_millis(300), &mut fallback) {
+        return Some(a);
+    }
+    for up in &ups[1..] {
+        launch(*up);
+    }
+    wait_one(deadline, &mut fallback).or(fallback)
+}
+
 fn report(tx: &Sender<DnsEvent>, q: &[u8], ans: Option<&[u8]>, t0: Instant, tcp: bool, direct: bool) {
     let Some((name, qtype)) = parse_query(q) else { return };
     let (status, ips, cname) = match ans.and_then(parse_answer) {
@@ -271,7 +525,7 @@ fn report(tx: &Sender<DnsEvent>, q: &[u8], ans: Option<&[u8]>, t0: Instant, tcp:
 
 /// Resolve through the tunnel, or directly for notToVPN names (and route
 /// the answer's IPs outside the tunnel before the app sees them).
-fn resolve(q: &[u8], ups: &[SocketAddr], bypass: Option<&crate::split::Bypass>, tcp: bool, no_aaaa: bool) -> (Option<Vec<u8>>, bool) {
+fn resolve(q: &[u8], ups: &[SocketAddr], bypass: Option<&crate::split::Bypass>, _tcp: bool, no_aaaa: bool) -> (Option<Vec<u8>>, bool) {
     if no_aaaa && q.len() > 12 {
         if let Some((_, t)) = parse_query(q) {
             if t == "AAAA" {
@@ -279,7 +533,22 @@ fn resolve(q: &[u8], ups: &[SocketAddr], bypass: Option<&crate::split::Bypass>, 
             }
         }
     }
-    let ask = |servers: &[SocketAddr]| if tcp { ask_tcp(q, servers).or_else(|| ask_udp(q, servers)) } else { ask_udp(q, servers).or_else(|| ask_tcp(q, servers)) };
+    let direct = bypass.is_some_and(|b| parse_query(q).is_some_and(|(n, _)| b.matches(&n) && !b.direct_dns.is_empty()));
+    if let Some(hit) = cache_get(q, direct) {
+        if let Some(b) = bypass.filter(|_| direct) {
+            if let Some((_, ips, _)) = parse_answer(&hit) {
+                b.add_ips(&ips); // already routed; re-adds only if rules were reset
+            }
+        }
+        return (Some(hit), direct);
+    }
+    let ask = |servers: &[SocketAddr]| {
+        let a = race(q, servers);
+        if let Some(a) = &a {
+            cache_put(q, a, direct);
+        }
+        a
+    };
     if let Some(b) = bypass {
         if let Some((name, _)) = parse_query(q) {
             if b.matches(&name) && !b.direct_dns.is_empty() {
@@ -375,6 +644,57 @@ impl DnsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// answer = query + one A record 10.1.2.3 (ttl 300)
+    fn fake_answer(q: &[u8]) -> Vec<u8> {
+        let mut a = empty_reply(q).unwrap();
+        a[7] = 1; // ancount
+        a.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 10, 1, 2, 3]);
+        a
+    }
+
+    #[test]
+    fn race_survives_lost_udp_and_caches() {
+        // upstream whose UDP is a black hole, but TCP answers
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp.local_addr().unwrap().port();
+        let tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::spawn(move || {
+            for c in tcp.incoming() {
+                let mut c = c.unwrap();
+                std::thread::spawn(move || loop {
+                    let mut len = [0u8; 2];
+                    if c.read_exact(&mut len).is_err() { return; }
+                    let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+                    if c.read_exact(&mut q).is_err() { return; }
+                    let a = fake_answer(&q);
+                    let mut out = (a.len() as u16).to_be_bytes().to_vec();
+                    out.extend_from_slice(&a);
+                    if c.write_all(&out).is_err() { return; }
+                });
+            }
+        });
+        let up: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let q = build_query("race.test", 0x7777);
+        let t0 = Instant::now();
+        let a = race(&q, &[up]).expect("answer over TCP");
+        assert!(t0.elapsed() < Duration::from_millis(600), "took {:?}", t0.elapsed());
+        assert_eq!(&a[..2], &[0x77, 0x77]);
+        assert_eq!(parse_answer(&a).unwrap().1, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
+        // pipelined: many at once over the same connection
+        let hs: Vec<_> = (0..20u16).map(|i| std::thread::spawn(move || race(&build_query(&format!("n{i}.test"), 100 + i), &[up]))).collect();
+        for (i, h) in hs.into_iter().enumerate() {
+            let a = h.join().unwrap().unwrap();
+            assert_eq!(u16::from_be_bytes([a[0], a[1]]), 100 + i as u16);
+        }
+        // cache: same name, other id → instant, id rewritten
+        cache_put(&q, &a, false);
+        let q2 = build_query("RACE.test", 0x1234);
+        let hit = cache_get(&q2, false).unwrap();
+        assert_eq!(&hit[..2], &[0x12, 0x34]);
+        assert!(cache_get(&q2, true).is_none());
+        drop(udp);
+    }
 
     #[test]
     fn empty_aaaa_reply() {
