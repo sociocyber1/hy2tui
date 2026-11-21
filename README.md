@@ -1,9 +1,11 @@
-<img width="1312" height="800" alt="hy2ui" src="https://github.com/user-attachments/assets/47e1c381-df98-4310-b9fb-00fc3655c965" />
+
 # hy2tui
 
 Консольный клиент **Hysteria2** с режимом **TUN**: весь трафик системы идёт через VPN, как в nekoray.
 Дашборд в стиле btop: графики скорости и пакетов, живой список соединений с доменами и
 приложениями, лог DNS-запросов, задержка, внешний IP, анимации.
+
+<img width="1312" height="800" alt="hy2ui" src="https://github.com/user-attachments/assets/47e1c381-df98-4310-b9fb-00fc3655c965" />
 
 ## Прокси для браузера: 127.0.0.1:2080
 
