@@ -6,6 +6,7 @@
 приложениями, лог DNS-запросов, задержка, внешний IP, анимации.
 
 <img width="1312" height="800" alt="hy2ui" src="https://github.com/user-attachments/assets/47e1c381-df98-4310-b9fb-00fc3655c965" />
+<img width="1563" height="707" alt="2026-11-21_00-46" src="https://github.com/user-attachments/assets/c98f05e2-c03c-4395-a516-10405f6c95ff" />
 
 ## Прокси для браузера: 127.0.0.1:2080
 
