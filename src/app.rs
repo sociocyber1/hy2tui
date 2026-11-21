@@ -156,6 +156,15 @@ pub struct App {
     pub dns_bench: Vec<(String, String, Option<u64>)>,
     pub dns_benching: bool,
     auto_repaired: bool,
+    /// watchdog: when the last automatic repair ran, and how many in a row
+    last_repair: Option<Instant>,
+    repairs: u32,
+    /// physical default route ("wlan0 via 192.168.1.1"), to notice Wi-Fi changes
+    net_sig: Option<String>,
+    net_changed_at: Option<Instant>,
+    last_watch: Instant,
+    /// connect failed for lack of network: (profile, next try)
+    retry_connect: Option<(usize, Instant)>,
     last_proxy_addr: String,
     last_apps: Instant,
     log_tx: Sender<LogLine>,
@@ -187,7 +196,7 @@ impl App {
             tab: Tab::Overview, traffic: Traffic::default(), dns_log: VecDeque::new(),
             conn_scroll: 0, dns_scroll: 0, only_open: false,
             frame: 0, flow_down: 0.0, flow_up: 0.0, disp_down: 0.0, disp_up: 0.0,
-            dns_tx, dns_rx, probing_apps: false, dns_times: Default::default(), dns_probing: false, dns_bench: vec![], dns_benching: false, auto_repaired: false, last_proxy_addr, last_apps: Instant::now(),
+            dns_tx, dns_rx, probing_apps: false, dns_times: Default::default(), dns_probing: false, dns_bench: vec![], dns_benching: false, auto_repaired: false, last_repair: None, repairs: 0, net_sig: net::default_route(), net_changed_at: None, last_watch: Instant::now(), retry_connect: None, last_proxy_addr, last_apps: Instant::now(),
             log_tx, log_rx, probe_tx, probe_rx,
             probing_lat: false, probing_ip: false, last_lat: None, last_ip: None,
             last_sample: Instant::now(), last_dns_check: Instant::now(), clk: net::clk_tck(),
@@ -246,10 +255,15 @@ impl App {
         let server_ips = match net::resolve(&uri.host) {
             Ok(v) if !v.is_empty() => v,
             Ok(_) | Err(_) => {
-                self.toast(format!("Cannot resolve {} — check internet", uri.host), true);
+                // no network yet (Wi-Fi off, still connecting…): keep trying
+                self.retry_connect = Some((idx, Instant::now() + Duration::from_secs(4)));
+                self.store.last_used = Some(idx);
+                self.status = Status::Failed("waiting for network…".into());
+                self.toast(format!("Cannot resolve {} — waiting for the network, will retry", uri.host), true);
                 return;
             }
         };
+        self.retry_connect = None;
         let s = self.store.settings.clone();
         let want_proxy = !s.proxy.trim().is_empty();
         if !s.tun && !want_proxy {
@@ -383,10 +397,18 @@ impl App {
     /// state (DNS, TUN devices, routes — e.g. after CyberVPN was closed) and
     /// try once more, like `hy2tui reset` + reconnect by hand.
     fn auto_repair(&mut self) {
+        self.repair_because("could not reach the server");
+    }
+
+    /// Tear down, reset leftover network state (TUN devices, routes, DNS)
+    /// and reconnect. Used by the watchdog; spaced out 15 s → 2 min.
+    fn repair_because(&mut self, why: &str) {
         let Some(idx) = self.store.last_used else { return };
         self.auto_repaired = true;
+        self.last_repair = Some(Instant::now());
+        self.repairs += 1;
         self.disconnect();
-        let mut msgs = vec!["could not reach the server — resetting network state and retrying".to_string()];
+        let mut msgs = vec![format!("{why} — resetting network state and reconnecting")];
         if crate::store::is_root() {
             msgs.extend(net::network_reset(&self.store.settings.tun_name));
         }
@@ -398,11 +420,85 @@ impl App {
     }
 
     pub fn disconnect(&mut self) {
+        self.retry_connect = None;
         if self.session.take().is_some() {
             self.log(Level::Info, "disconnected; DNS and routes restored");
             self.toast("Disconnected", false);
         }
         self.status = Status::Disconnected;
+    }
+
+    // ------------------------------------------------------------ watchdog
+
+    /// Keeps the VPN working on its own, like toggling Wi-Fi by hand did:
+    ///  * the TUN device is missing although the core runs,
+    ///  * stuck "connecting" for 25 s,
+    ///  * connected but nothing gets through for ~15 s,
+    ///  * the network changed (Wi-Fi off/on, other network) → fresh connect,
+    ///  * no network at start → wait for it, then connect.
+    fn watchdog(&mut self) {
+        if self.last_watch.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_watch = Instant::now();
+        let now = Instant::now();
+
+        // network change?
+        let sig = net::default_route();
+        if sig != self.net_sig {
+            let had = self.net_sig.is_some();
+            self.net_sig = sig.clone();
+            if had || sig.is_some() {
+                self.net_changed_at = Some(now);
+                self.log(Level::Info, match &sig {
+                    Some(s) => format!("network: {s}"),
+                    None => "network: offline".to_string(),
+                });
+            }
+        }
+
+        // waiting for the network to come up
+        if let Some((idx, at)) = self.retry_connect {
+            if self.session.is_none() && now >= at && self.net_sig.is_some() {
+                self.connect(idx);
+            } else if self.net_sig.is_none() {
+                self.retry_connect = Some((idx, now + Duration::from_secs(2)));
+            }
+            return;
+        }
+        if !self.store.settings.auto_reconnect {
+            return;
+        }
+        let Some(sess) = &self.session else { return };
+        // a successful hour resets the back-off
+        if self.status == Status::Connected && self.last_repair.is_some_and(|t| t.elapsed() > Duration::from_secs(120)) {
+            self.repairs = 0;
+        }
+        let gap = Duration::from_secs((15u64 << self.repairs.min(3)).min(120));
+        if self.last_repair.is_some_and(|t| t.elapsed() < gap) {
+            return;
+        }
+        if self.net_sig.is_none() {
+            return; // offline: nothing to repair until the network is back
+        }
+        let tun = self.store.settings.tun;
+        let up = sess.started.elapsed();
+        let why = if self.net_changed_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(2)) {
+            self.net_changed_at = None;
+            (up > Duration::from_secs(3)).then_some("the network changed")
+        } else if tun && sess.child.is_some() && up > Duration::from_secs(6) && !net::iface_exists(&self.store.settings.tun_name) {
+            Some("the TUN device was not created")
+        } else if matches!(self.status, Status::Connecting | Status::Reconnecting(_)) && up > Duration::from_secs(25) && sess.connected_at.is_none() {
+            Some("still not connected after 25 s")
+        } else if self.status == Status::Connected && self.stats.lat_fail >= 5 {
+            Some("connected, but nothing gets through")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.stats.lat_fail = 0;
+            self.repair_because(why);
+        }
     }
 
     // ------------------------------------------------------------ periodic
@@ -448,6 +544,7 @@ impl App {
         if repair {
             self.auto_repair();
         }
+        self.watchdog();
         // DNS queries
         while let Ok(ev) = self.dns_rx.try_recv() {
             self.stats.dns_queries += 1;

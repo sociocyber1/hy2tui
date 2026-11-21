@@ -194,6 +194,33 @@ fn http_get(host: &str, path: &str, via: Option<SocketAddr>, timeout: Duration) 
 
 /// Round-trip through the tunnel: time to first byte of an HTTP reply
 /// from 1.1.1.1 (TCP connect alone would be answered locally by the TUN stack).
+/// The physical default route, e.g. "wlan0 via 192.168.1.1" (None = offline).
+/// TUN devices are ignored, so this only changes when the real network does.
+pub fn default_route() -> Option<String> {
+    let t = fs::read_to_string("/proc/net/route").ok()?;
+    let mut best: Option<(u32, String)> = None;
+    for l in t.lines().skip(1) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 8 || f[1] != "00000000" || f[7] != "00000000" {
+            continue;
+        }
+        let (iface, gw) = (f[0], u32::from_str_radix(f[2], 16).unwrap_or(0));
+        if iface.starts_with("tun") || iface == "hytun" || iface == "cybervpn" || iface.starts_with("nekoray") || iface.starts_with("sing") {
+            continue;
+        }
+        let metric: u32 = f.get(6).and_then(|m| m.parse().ok()).unwrap_or(0);
+        let gw = std::net::Ipv4Addr::from(gw.swap_bytes());
+        if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+            best = Some((metric, format!("{iface} via {gw}")));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+pub fn iface_exists(name: &str) -> bool {
+    Path::new("/sys/class/net").join(name).exists()
+}
+
 pub fn latency_ms(via: Option<SocketAddr>) -> Option<u64> {
     http_get("1.1.1.1", "/", via, Duration::from_secs(5)).ok().map(|(d, _)| d.as_millis() as u64)
 }
@@ -401,6 +428,20 @@ pub fn tun_preflight(own_tun: &str, other_tuns: &[&str]) -> anyhow::Result<Vec<S
     tuns.extend_from_slice(other_tuns);
     cleanup_routes(&tuns, &mut log);
     Ok(log)
+}
+
+#[cfg(test)]
+mod route_tests {
+    #[test]
+    fn reads_default_route() {
+        let r = super::default_route();
+        println!("default route: {r:?}");
+        if let Some(r) = r {
+            assert!(r.contains(" via "));
+        }
+        assert!(super::iface_exists("lo"));
+        assert!(!super::iface_exists("no-such-if0"));
+    }
 }
 
 #[cfg(test)]
